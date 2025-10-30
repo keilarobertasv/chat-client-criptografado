@@ -477,6 +477,26 @@ class LoginWindow(QMainWindow):
                 return
 
         if private_key:
+            public_key_file = f"{current_username}_public_key.pem"
+            try:
+                with open(public_key_file, 'r') as f:
+                    public_key_content = f.read()
+                
+                request = {"action": "store_public_key", "payload": {"public_key": public_key_content}}
+                response = self.network_client.send_request(request)
+
+                if not response or response.get("status") != "success":
+                    error_msg = response.get("message", "Erro desconhecido.") if response else "Servidor não respondeu."
+                    self.show_error("Falha ao Enviar Chave", f"Não foi possível salvar sua chave pública no servidor: {error_msg}")
+                    return
+
+            except FileNotFoundError:
+                self.show_error("Erro de Chave", f"Arquivo de chave pública {public_key_file} não encontrado.")
+                return
+            except Exception as e:
+                self.show_error("Erro Inesperado", f"Não foi possível ler ou enviar a chave: {e}")
+                return
+            
             self.is_switching_windows = True
             self.chat_window = ChatWindow(self.network_client, current_username, self.db, private_key)
             self.chat_window.show()
