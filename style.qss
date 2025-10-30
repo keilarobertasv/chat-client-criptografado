@@ -1,0 +1,82 @@
+QMainWindow {
+    background-color: #2c3e50; 
+}
+QLabel {
+    color:  #ecf0f1;
+    font-size: 14px;
+    font-weight: bold;
+}
+QLineEdit {
+    border: 2px solid #3498db; 
+    border-radius: 8px;
+    padding: 5px;
+    background-color: #34495e; 
+    color: #ecf0f1; 
+    font-size: 14px;
+    min-height: 25px; 
+}
+
+QMessageBox {
+    color: black;         
+    background-color: #34495e;  
+    font-size: 12pt;      
+    font-weight: bold;
+}
+
+QInputDialog {
+    background-color: #34495e;  
+    color: #eeeeee;   
+}
+
+QInputDialog QLineEdit {
+    background-color: #34495e;  
+    color: #eeeeee;
+    border: 1px solid #555555;
+}
+
+QPushButton {
+    color: white;
+    background-color: red;
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+#login_button {
+    background-color: #e74c3c; 
+}
+#login_button:hover {
+    background-color: #c0392b; 
+}
+
+#register_button {
+    background-color: #566573;
+}
+#register_button:hover {
+    background-color: #414a52; 
+}
+
+QListWidget {
+    background-color: #34495e; 
+    border: 2px solid #3498db; 
+    border-radius: 8px;
+    color: #ecf0f1; 
+    font-size: 14px;
+    outline: 0px; 
+}
+
+QListWidget::item {
+    padding: 8px;
+    border-radius: 5px;
+    color: #ecf0f1; 
+}
+
+QListWidget::item:hover {
+    background-color: #415a72; 
+}
+
+QListWidget::item:selected {
+    background-color: #e74c3c; 
+    color: white;
+}
