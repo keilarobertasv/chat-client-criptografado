@@ -207,7 +207,7 @@ class NetworkClient(QtCore.QObject):
 
 	def send_request(self, request_data):
 		if not self.socket:
-			return None
+			return
 		try:
 			with self.lock:
 				plaintext_json_str = json.dumps(request_data)
@@ -215,26 +215,10 @@ class NetworkClient(QtCore.QObject):
 				
 				self.socket.sendall(encrypted_payload + b'\n')
 				
-				action = request_data.get("action")
-				
-				if action in ["login", "register", "store_public_key"]:
-					response_data = self.socket.recv(4096)
-					
-					if response_data:
-						decrypted_json_str = self._decrypt(response_data)
-						if decrypted_json_str:
-							return json.loads(decrypted_json_str)
-						else:
-							return {"status": "error", "message": "Mensagem do servidor falhou na verificação de integridade."}
-					else:
-						return {"status": "error", "message": "Servidor não respondeu."}
-				
-				return {"status": "request_sent"}
 		except socket.error as e:
 			self.connection_error.emit("Falha ao enviar dados. Conexão instável.")
-			return None
 		except Exception as e:
-			return {"status": "error", "message": f"Erro de rede inesperado: {e}"}
+			print(f"Erro inesperado ao enviar: {e}")
 
 	def close(self):
 		self.listening = False
