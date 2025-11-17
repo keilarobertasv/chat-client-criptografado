@@ -1,5 +1,6 @@
 import sys
 import os
+import base64
 from PyQt6.QtWidgets import QMainWindow, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QLabel, QInputDialog
 from PyQt6 import QtCore
 from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QBrush, QIcon, QTextCursor 
@@ -9,8 +10,8 @@ from chat_ui import Ui_MainWindow as Ui_ChatWindow
 from network import NetworkClient
 from database import ChatDatabase
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 class ChatWindow(QMainWindow):
@@ -86,6 +87,7 @@ class ChatWindow(QMainWindow):
     @QtCore.pyqtSlot(dict)
     def on_message_received(self, message):
         msg_type = message.get("type")
+        
         if msg_type == "contact_list":
             self.all_users = message.get("all_users", [])
             self.online_users = set(message.get("online_users", []))
@@ -329,11 +331,13 @@ class LoginWindow(QMainWindow):
     def __init__(self, network_client, db): 
         super().__init__()
         self.network_client = network_client
+        self.network_client.message_received.connect(self.on_server_message)
         self.db = db 
         self.chat_window = None
         self.ui = Ui_LoginWindow()
         self.ui.setupUi(self)
         self.is_switching_windows = False
+        self.current_private_key = None
         
         self.setWindowTitle("KeiChat - Login")
         
@@ -359,24 +363,71 @@ class LoginWindow(QMainWindow):
 
     def login_action(self):
         username = self.ui.username_entry.text()
-        password = self.ui.password_entry.text()
-        if not username or not password:
-            self.show_error("Erro", "Usuário e senha não podem estar vazios.")
+        if not username:
+            self.show_error("Erro", "Nome de usuário não pode estar vazio.")
             return
 
         if not self.network_client.socket:
             if not self.network_client.connect(): 
-                self.show_error("Falha na Conexão", "Não foi possível conectar ao servidor. Verifique o host/porta.")
+                self.show_error("Falha na Conexão", "Não foi possível conectar ao servidor.")
                 return
+        
+        private_key = self.load_keys_for_login(username)
+        if not private_key:
+            return
+        
+        self.current_private_key = private_key
+        self.network_client.start_listening()
 
-        request = {"action": "login", "payload": {"username": username, "password": password}}
-        response = self.network_client.send_request(request)
+        request = {"action": "auth_challenge", "payload": {"username": username}}
+        self.network_client.send_request(request)
 
-        if response and response.get("status") == "success":
-            self.open_chat_window()
-        else:
-            error_message = response.get("message", "Erro desconhecido.") if response else "Servidor não respondeu."
-            self.show_error("Falha no Login", error_message)
+    @QtCore.pyqtSlot(dict)
+    def on_server_message(self, message):
+        msg_type = message.get("type")
+        msg_status = message.get("status")
+
+        if msg_type == "auth_challenge":
+            self.handle_auth_challenge(message.get("payload"))
+            return
+        
+        if msg_status == "success" and message.get("message") == "Login bem-sucedido.":
+            self.open_chat_window(self.current_private_key)
+            return
+        
+        if msg_status == "error":
+            self.show_error("Falha na Autenticação", message.get("message", "Erro desconhecido."))
+            return
+
+    def handle_auth_challenge(self, payload):
+        if not payload or "nonce" not in payload:
+            self.show_error("Falha na Autenticação", "Desafio de autenticação inválido recebido do servidor.")
+            return
+        
+        if not self.current_private_key:
+            self.show_error("Erro Crítico", "Chave privada não está carregada para assinar o desafio.")
+            return
+            
+        try:
+            nonce = base64.b64decode(payload["nonce"])
+            
+            signature = self.current_private_key.sign(
+                nonce,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            
+            request = {
+                "action": "auth_response",
+                "payload": {"signature": base64.b64encode(signature).decode('utf-8')}
+            }
+            self.network_client.send_request(request)
+
+        except Exception as e:
+            self.show_error("Erro de Criptografia", f"Não foi possível assinar o desafio: {e}")
 
     def register_action(self):
         username = self.ui.username_entry.text()
@@ -384,15 +435,42 @@ class LoginWindow(QMainWindow):
         if not username or not password:
             self.show_error("Erro", "Usuário e senha não podem estar vazios.")
             return
+        
+        QMessageBox.information(self, "Configuração Inicial", 
+                                "Vamos criar um par de chaves (pública/privada) para você.")
+        
+        passphrase, ok = QInputDialog.getText(self, "Criar Senha da Chave", 
+                                             "Crie uma senha FORTE para proteger sua nova chave privada.\n"
+                                             "Esta senha será usada para todos os logins futuros.\n"
+                                             "NÃO ESQUEÇA ESSA SENHA!", 
+                                             QLineEdit.EchoMode.Password)
+        
+        if not ok or not passphrase:
+            self.show_error("Criação de Chave Cancelada", "Você precisa criar uma senha para a chave para continuar.")
+            return
+        
+        try:
+            private_key, public_key_pem = self._generate_and_store_keys(username, passphrase)
+        except Exception as e:
+            self.show_error("Erro ao Gerar Chave", f"Não foi possível gerar as chaves: {e}")
+            return
+        
+        request_register = {"action": "register", "payload": {"username": username, "password": password}}
+        response_register = self.network_client.send_request(request_register)
 
-        request = {"action": "register", "payload": {"username": username, "password": password}}
-        response = self.network_client.send_request(request)
-
-        if response and response.get("status") == "success":
-            self.show_info("Sucesso", response.get("message"))
-        else:
-            error_message = response.get("message", "Erro desconhecido.") if response else "Servidor não respondeu."
+        if not response_register or response_register.get("status") != "success":
+            error_message = response_register.get("message", "Erro desconhecido.") if response_register else "Servidor não respondeu."
             self.show_error("Falha no Registro", error_message)
+            return
+        
+        request_key = {"action": "store_public_key", "payload": {"public_key": public_key_pem}}
+        response_key = self.network_client.send_request(request_key)
+        
+        if response_key and response_key.get("status") == "success":
+            self.show_info("Sucesso", "Usuário registrado e chave pública armazenada com sucesso!")
+        else:
+            error_message = response_key.get("message", "Erro desconheciodo.") if response_key else "Servidor não respondeu."
+            self.show_error("Falha no Registro", f"Usuário criado, mas falha ao salvar chave pública: {error_message}")
     
     def _generate_and_store_keys(self, username, passphrase):
         private_key_file = f"{username}_private_key.pem"
@@ -417,10 +495,11 @@ class LoginWindow(QMainWindow):
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-        with open(public_key_file, 'wb') as f:
-            f.write(pem_public)
+        public_key_content = pem_public.decode('utf-8')
+        with open(public_key_file, 'w') as f:
+            f.write(public_key_content)
         
-        return private_key
+        return private_key, public_key_content
 
     def _load_private_key(self, username, passphrase):
         private_key_file = f"{username}_private_key.pem"
@@ -436,71 +515,39 @@ class LoginWindow(QMainWindow):
             self.show_error("Erro de Chave", "Senha da chave privada incorreta.")
             return None
         except FileNotFoundError:
-             self.show_error("Erro de Chave", "Arquivo de chave privada não encontrado.")
+             self.show_error("Erro de Chave", f"Arquivo de chave privada '{private_key_file}' não encontrado.")
              return None
         except Exception as e:
             self.show_error("Erro ao Carregar Chave", f"Um erro inesperado ocorreu: {e}")
             return None
 
-    def open_chat_window(self):
-        current_username = self.ui.username_entry.text()
-        private_key_file = f"{current_username}_private_key.pem"
+    def load_keys_for_login(self, username):
+        private_key_file = f"{username}_private_key.pem"
         private_key = None
 
-        if os.path.exists(private_key_file):
-            passphrase, ok = QInputDialog.getText(self, "Chave Privada", 
-                                                 "Digite a senha para descriptografar sua chave privada:", 
-                                                 QLineEdit.EchoMode.Password)
-            if not ok or not passphrase:
-                return 
-            
-            private_key = self._load_private_key(current_username, passphrase)
+        if not os.path.exists(private_key_file):
+            self.show_error("Falha no Login", f"Arquivo de chave privada '{private_key_file}' não encontrado.\n"
+                            "Se este é um novo dispositivo, você precisa se registrar primeiro (não implementado).")
+            return None
         
-        else:
-            QMessageBox.information(self, "Configuração Inicial", 
-                                    "Não encontramos chaves de criptografia. Vamos criar um par de chaves (pública/privada) para você.")
-            
-            passphrase, ok = QInputDialog.getText(self, "Criar Senha da Chave", 
-                                                 "Crie uma senha FORTE para proteger sua nova chave privada.\n"
-                                                 "NÃO ESQUEÇA ESSA SENHA!", 
-                                                 QLineEdit.EchoMode.Password)
-            
-            if not ok or not passphrase:
-                self.show_error("Criação de Chave Cancelada", "Você precisa criar uma senha para a chave para continuar.")
-                return
+        passphrase, ok = QInputDialog.getText(self, "Chave Privada", 
+                                             "Digite a senha para descriptografar sua chave privada:", 
+                                             QLineEdit.EchoMode.Password)
+        if not ok or not passphrase:
+            return None
+        
+        private_key = self._load_private_key(username, passphrase)
+        return private_key
 
-            try:
-                private_key = self._generate_and_store_keys(current_username, passphrase)
-                self.show_info("Sucesso", f"Chaves salvas como {private_key_file} e {current_username}_public_key.pem")
-            except Exception as e:
-                self.show_error("Erro ao Gerar Chave", f"Não foi possível gerar as chaves: {e}")
-                return
-
-        if private_key:
-            public_key_file = f"{current_username}_public_key.pem"
-            try:
-                with open(public_key_file, 'r') as f:
-                    public_key_content = f.read()
-                
-                request = {"action": "store_public_key", "payload": {"public_key": public_key_content}}
-                response = self.network_client.send_request(request)
-
-                if not response or response.get("status") != "success":
-                    error_msg = response.get("message", "Erro desconhecido.") if response else "Servidor não respondeu."
-                    self.show_error("Falha ao Enviar Chave", f"Não foi possível salvar sua chave pública no servidor: {error_msg}")
-                    return
-
-            except FileNotFoundError:
-                self.show_error("Erro de Chave", f"Arquivo de chave pública {public_key_file} não encontrado.")
-                return
-            except Exception as e:
-                self.show_error("Erro Inesperado", f"Não foi possível ler ou enviar a chave: {e}")
-                return
-            
-            self.is_switching_windows = True
-            self.chat_window = ChatWindow(self.network_client, current_username, self.db, private_key)
-            self.chat_window.show()
-            self.close()
+    def open_chat_window(self, private_key):
+        self.is_switching_windows = True
+        current_username = self.ui.username_entry.text()
+        
+        self.network_client.message_received.disconnect(self.on_server_message)
+        
+        self.chat_window = ChatWindow(self.network_client, current_username, self.db, private_key)
+        self.chat_window.show()
+        self.close()
 
     def closeEvent(self, event):
         if not self.is_switching_windows:
