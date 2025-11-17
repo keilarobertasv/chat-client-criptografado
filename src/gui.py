@@ -63,6 +63,7 @@ class ChatWindow(QMainWindow):
         
         self.network_client.message_received.connect(self.on_message_received)
         self.network_client.connection_error.connect(self.on_connection_error)
+        
         self.network_client.start_listening()
         
         self.request_initial_data()
@@ -365,7 +366,9 @@ class LoginWindow(QMainWindow):
         super().__init__()
         self.network_client = network_client
         self.network_client.message_received.connect(self.on_server_message)
+        self.network_client.connection_error.connect(self.on_connection_error_login)
         self.db = db 
+        
         self.chat_window = None
         self.ui = Ui_LoginWindow()
         self.ui.setupUi(self)
@@ -395,6 +398,11 @@ class LoginWindow(QMainWindow):
         msg.setText(message)
         msg.setIcon(QMessageBox.Icon.Information)
         msg.exec()
+        
+    @QtCore.pyqtSlot(str)
+    def on_connection_error_login(self, message):
+        if not self.is_switching_windows:
+            self.show_error("Erro de Conexão", message)
 
     def login_action(self):
         username = self.ui.username_entry.text()
@@ -487,10 +495,10 @@ class LoginWindow(QMainWindow):
                                 "Vamos criar um par de chaves (pública/privada) para você.")
         
         passphrase, ok = QInputDialog.getText(self, "Criar Senha da Chave", 
-                                             "Crie uma senha FORTE para proteger sua nova chave privada.\n"
-                                             "Esta senha será usada para todos os logins futuros.\n"
-                                             "NÃO ESQUEÇA ESSA SENHA!", 
-                                             QLineEdit.EchoMode.Password)
+                                            "Crie uma senha FORTE para proteger sua nova chave privada.\n"
+                                            "Esta senha será usada para todos os logins futuros.\n"
+                                            "NÃO ESQUEÇA ESSA SENHA!", 
+                                            QLineEdit.EchoMode.Password)
         
         if not ok or not passphrase:
             self.show_error("Criação de Chave Cancelada", "Você precisa criar uma senha para a chave para continuar.")
@@ -574,8 +582,8 @@ class LoginWindow(QMainWindow):
         
         self.ui.password_entry.blockSignals(True)
         passphrase, ok = QInputDialog.getText(self, "Chave Privada", 
-                                             "Digite a senha para descriptografar sua chave privada:", 
-                                             QLineEdit.EchoMode.Password)
+                                            "Digite a senha para descriptografar sua chave privada:", 
+                                            QLineEdit.EchoMode.Password)
         self.ui.password_entry.blockSignals(False)
         if not ok or not passphrase:
             return None
@@ -588,6 +596,7 @@ class LoginWindow(QMainWindow):
         current_username = self.ui.username_entry.text()
         
         self.network_client.message_received.disconnect(self.on_server_message)
+        self.network_client.connection_error.disconnect(self.on_connection_error_login)
         
         self.chat_window = ChatWindow(self.network_client, current_username, self.db, private_key)
         self.chat_window.show()
