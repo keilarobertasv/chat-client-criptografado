@@ -12,7 +12,7 @@ from database import ChatDatabase
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
 
 class ChatWindow(QMainWindow):
     def __init__(self, network_client, current_username, db, private_key): 
@@ -23,6 +23,8 @@ class ChatWindow(QMainWindow):
         self.private_key = private_key
         self.ui = Ui_ChatWindow()
         self.ui.setupUi(self)
+        
+        self.public_keys_cache = {}
         
         self.setWindowTitle(f"KeiChat - Conectado como {self.current_user}")
 
@@ -87,6 +89,32 @@ class ChatWindow(QMainWindow):
     @QtCore.pyqtSlot(dict)
     def on_message_received(self, message):
         msg_type = message.get("type")
+        
+        if msg_type == "public_key_response":
+            payload = message.get("payload", {})
+            username = payload.get("username")
+            key_pem = payload.get("public_key")
+            if username and key_pem:
+                try:
+                    public_key = load_pem_public_key(key_pem.encode('utf-8'))
+                    self.public_keys_cache[username] = public_key
+                    print(f"Chave pública de {username} recebida e armazenada.")
+                except Exception as e:
+                    print(f"Erro ao carregar chave pública de {username}: {e}")
+            return
+
+        if msg_type == "p2p_handshake_offer":
+            payload = message.get("payload", {})
+            username = payload.get("username")
+            key_pem = payload.get("public_key")
+            if username and key_pem:
+                try:
+                    public_key = load_pem_public_key(key_pem.encode('utf-8'))
+                    self.public_keys_cache[username] = public_key
+                    print(f"Oferta de handshake e chave pública de {username} recebidos.")
+                except Exception as e:
+                    print(f"Erro ao carregar chave pública de {username} (oferta): {e}")
+            return
         
         if msg_type == "contact_list":
             self.all_users = message.get("all_users", [])
@@ -264,6 +292,11 @@ class ChatWindow(QMainWindow):
             self.unread_senders.discard(contact_name)
             self.populate_contacts()
         
+        if contact_name not in self.public_keys_cache:
+            print(f"Solicitando chave pública para: {contact_name}")
+            request = {"action": "get_public_key", "payload": {"username": contact_name}}
+            self.network_client.send_request(request)
+        
         self.chat_display.clear()
         
         history = self.db.get_conversation_history(self.current_user, contact_name)
@@ -338,6 +371,8 @@ class LoginWindow(QMainWindow):
         self.ui.setupUi(self)
         self.is_switching_windows = False
         self.current_private_key = None
+        self.pending_public_key_pem = None
+        self.registration_in_progress = False
         
         self.setWindowTitle("KeiChat - Login")
         
@@ -386,17 +421,29 @@ class LoginWindow(QMainWindow):
     def on_server_message(self, message):
         msg_type = message.get("type")
         msg_status = message.get("status")
-
+        
         if msg_type == "auth_challenge":
             self.handle_auth_challenge(message.get("payload"))
             return
         
-        if msg_status == "success" and message.get("message") == "Login bem-sucedido.":
-            self.open_chat_window(self.current_private_key)
+        if msg_status == "success":
+            if message.get("message") == "Login bem-sucedido.":
+                self.open_chat_window(self.current_private_key)
+                return
+            
+            if self.registration_in_progress:
+                self.show_info("Sucesso", message.get("message"))
+                self.registration_in_progress = False
+                self.pending_public_key_pem = None
             return
         
         if msg_status == "error":
-            self.show_error("Falha na Autenticação", message.get("message", "Erro desconhecido."))
+            error_msg = message.get("message", "Erro desconhecido.")
+            if self.registration_in_progress:
+                self.show_error("Falha no Registro", error_msg)
+                self.registration_in_progress = False
+            else:
+                self.show_error("Falha na Operação", error_msg)
             return
 
     def handle_auth_challenge(self, payload):
@@ -451,26 +498,21 @@ class LoginWindow(QMainWindow):
         
         try:
             private_key, public_key_pem = self._generate_and_store_keys(username, passphrase)
+            self.pending_public_key_pem = public_key_pem
+            self.registration_in_progress = True
         except Exception as e:
             self.show_error("Erro ao Gerar Chave", f"Não foi possível gerar as chaves: {e}")
             return
         
-        request_register = {"action": "register", "payload": {"username": username, "password": password}}
-        response_register = self.network_client.send_request(request_register)
-
-        if not response_register or response_register.get("status") != "success":
-            error_message = response_register.get("message", "Erro desconhecido.") if response_register else "Servidor não respondeu."
-            self.show_error("Falha no Registro", error_message)
-            return
-        
-        request_key = {"action": "store_public_key", "payload": {"public_key": public_key_pem}}
-        response_key = self.network_client.send_request(request_key)
-        
-        if response_key and response_key.get("status") == "success":
-            self.show_info("Sucesso", "Usuário registrado e chave pública armazenada com sucesso!")
-        else:
-            error_message = response_key.get("message", "Erro desconheciodo.") if response_key else "Servidor não respondeu."
-            self.show_error("Falha no Registro", f"Usuário criado, mas falha ao salvar chave pública: {error_message}")
+        request_register = {
+            "action": "register", 
+            "payload": {
+                "username": username, 
+                "password": password,
+                "public_key": public_key_pem
+            }
+        }
+        self.network_client.send_request(request_register)
     
     def _generate_and_store_keys(self, username, passphrase):
         private_key_file = f"{username}_private_key.pem"
@@ -530,9 +572,11 @@ class LoginWindow(QMainWindow):
                             "Se este é um novo dispositivo, você precisa se registrar primeiro (não implementado).")
             return None
         
+        self.ui.password_entry.blockSignals(True)
         passphrase, ok = QInputDialog.getText(self, "Chave Privada", 
                                              "Digite a senha para descriptografar sua chave privada:", 
                                              QLineEdit.EchoMode.Password)
+        self.ui.password_entry.blockSignals(False)
         if not ok or not passphrase:
             return None
         
