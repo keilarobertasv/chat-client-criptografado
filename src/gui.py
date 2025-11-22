@@ -99,9 +99,7 @@ class ChatWindow(QMainWindow):
                 try:
                     public_key = load_pem_public_key(key_pem.encode('utf-8'))
                     self.public_keys_cache[username] = public_key
-                    print(f"Chave pública de {username} recebida e armazenada.")
-                except Exception as e:
-                    print(f"Erro ao carregar chave pública de {username}: {e}")
+                except: pass
             return
 
         if msg_type == "p2p_handshake_offer":
@@ -112,9 +110,7 @@ class ChatWindow(QMainWindow):
                 try:
                     public_key = load_pem_public_key(key_pem.encode('utf-8'))
                     self.public_keys_cache[username] = public_key
-                    print(f"Oferta de handshake e chave pública de {username} recebidos.")
-                except Exception as e:
-                    print(f"Erro ao carregar chave pública de {username} (oferta): {e}")
+                except: pass
             return
         
         if msg_type == "contact_list":
@@ -150,7 +146,13 @@ class ChatWindow(QMainWindow):
 
             self.display_message(sender, self.current_user, text, timestamp) 
             
-            self.handle_typing_indicator(sender, "stopped") 
+            self.handle_typing_indicator(sender, "stopped")
+        
+        elif msg_type == "contact_key_changed":
+            target_user = message.get("username")
+            if target_user:
+                if target_user in self.public_keys_cache:
+                    del self.public_keys_cache[target_user]
             
         elif msg_type == "typing_indicator": 
             sender = message.get("sender")
@@ -293,8 +295,7 @@ class ChatWindow(QMainWindow):
             self.unread_senders.discard(contact_name)
             self.populate_contacts()
         
-        if contact_name not in self.public_keys_cache:
-            print(f"Solicitando chave pública para: {contact_name}")
+        if contact_name not in self.public_keys_cache:            
             request = {"action": "get_public_key", "payload": {"username": contact_name}}
             self.network_client.send_request(request)
         
@@ -406,6 +407,8 @@ class LoginWindow(QMainWindow):
 
     def login_action(self):
         username = self.ui.username_entry.text()
+        password = self.ui.password_entry.text()
+        
         if not username:
             self.show_error("Erro", "Nome de usuário não pode estar vazio.")
             return
@@ -415,15 +418,54 @@ class LoginWindow(QMainWindow):
                 self.show_error("Falha na Conexão", "Não foi possível conectar ao servidor.")
                 return
         
-        private_key = self.load_keys_for_login(username)
-        if not private_key:
-            return
+        private_key_file = f"{username}_private_key.pem"
         
-        self.current_private_key = private_key
-        self.network_client.start_listening()
+        if os.path.exists(private_key_file):
+            private_key = self.load_keys_for_login(username)
+            if not private_key: return
+            
+            self.current_private_key = private_key
+            self.network_client.start_listening()
+            
+            request = {"action": "auth_challenge", "payload": {"username": username}}
+            self.network_client.send_request(request)
+            
+        else:
+            if not password:
+                self.show_error("Novo Dispositivo", "Para entrar de um novo dispositivo, digite sua senha.")
+                return
 
-        request = {"action": "auth_challenge", "payload": {"username": username}}
-        self.network_client.send_request(request)
+            reply = QMessageBox.question(self, 'Novo Dispositivo Detectado', 
+                f"Não encontrei as chaves de segurança para '{username}' neste computador.\n"
+                "Deseja configurar este computador como seu novo dispositivo de acesso?\n\n"
+                "ATENÇÃO: Isso removerá o acesso de outros computadores.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.No: return
+
+            passphrase, ok = QInputDialog.getText(self, "Proteger Nova Chave", 
+                "Crie uma senha para proteger a chave de segurança deste computador:", 
+                QLineEdit.EchoMode.Password)
+            
+            if not ok or not passphrase: return
+
+            try:
+                self.network_client.start_listening()
+                private_key, public_key_pem = self._generate_and_store_keys(username, passphrase)
+                self.registration_in_progress = True
+                
+                request = {
+                    "action": "login_new_device",
+                    "payload": {
+                        "username": username,
+                        "password": password,
+                        "public_key": public_key_pem
+                    }
+                }
+                self.network_client.send_request(request)
+                
+            except Exception as e:
+                self.show_error("Erro", f"Falha ao configurar dispositivo: {e}")
 
     @QtCore.pyqtSlot(dict)
     def on_server_message(self, message):
@@ -495,10 +537,10 @@ class LoginWindow(QMainWindow):
                                 "Vamos criar um par de chaves (pública/privada) para você.")
         
         passphrase, ok = QInputDialog.getText(self, "Criar Senha da Chave", 
-                                            "Crie uma senha FORTE para proteger sua nova chave privada.\n"
-                                            "Esta senha será usada para todos os logins futuros.\n"
-                                            "NÃO ESQUEÇA ESSA SENHA!", 
-                                            QLineEdit.EchoMode.Password)
+                                                "Crie uma senha FORTE para proteger sua nova chave privada.\n"
+                                                "Esta senha será usada para todos os logins futuros.\n"
+                                                "NÃO ESQUEÇA ESSA SENHA!", 
+                                                QLineEdit.EchoMode.Password)
         
         if not ok or not passphrase:
             self.show_error("Criação de Chave Cancelada", "Você precisa criar uma senha para a chave para continuar.")
@@ -561,29 +603,19 @@ class LoginWindow(QMainWindow):
                     backend=default_backend()
                 )
             return private_key
-        except (ValueError, TypeError):
-            self.show_error("Erro de Chave", "Senha da chave privada incorreta.")
-            return None
-        except FileNotFoundError:
-             self.show_error("Erro de Chave", f"Arquivo de chave privada '{private_key_file}' não encontrado.")
-             return None
-        except Exception as e:
-            self.show_error("Erro ao Carregar Chave", f"Um erro inesperado ocorreu: {e}")
+        except:
+            self.show_error("Erro de Chave", "Senha da chave incorreta ou arquivo inválido.")
             return None
 
     def load_keys_for_login(self, username):
         private_key_file = f"{username}_private_key.pem"
-        private_key = None
-
         if not os.path.exists(private_key_file):
-            self.show_error("Falha no Login", f"Arquivo de chave privada '{private_key_file}' não encontrado.\n"
-                            "Se este é um novo dispositivo, você precisa se registrar primeiro (não implementado).")
             return None
         
         self.ui.password_entry.blockSignals(True)
         passphrase, ok = QInputDialog.getText(self, "Chave Privada", 
-                                            "Digite a senha para descriptografar sua chave privada:", 
-                                            QLineEdit.EchoMode.Password)
+                                                "Digite a senha para descriptografar sua chave privada:", 
+                                                QLineEdit.EchoMode.Password)
         self.ui.password_entry.blockSignals(False)
         if not ok or not passphrase:
             return None
