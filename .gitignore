@@ -2,3 +2,4 @@ __pycache__
 chat_history.db
 *_private_key.pem
 *_public_key.pem
+local_storage.key 
