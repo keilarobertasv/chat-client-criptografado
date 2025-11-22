@@ -3,7 +3,7 @@ import os
 import base64
 from PyQt6.QtWidgets import QMainWindow, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QLabel, QInputDialog
 from PyQt6 import QtCore
-from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QBrush, QIcon, QTextCursor 
+from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QBrush, QIcon
 from datetime import datetime
 from login_ui import Ui_MainWindow as Ui_LoginWindow
 from chat_ui import Ui_MainWindow as Ui_ChatWindow
@@ -33,8 +33,6 @@ class ChatWindow(QMainWindow):
         self.send_button = self.ui.send_button
         self.contacts_list = self.ui.contacts_list
         
-        self.message_cache = {}
-
         self.ui.horizontalLayout.setStretch(0, 1)
         self.ui.horizontalLayout.setStretch(1, 3)
         
@@ -103,17 +101,28 @@ class ChatWindow(QMainWindow):
             return
 
         if msg_type == "p2p_handshake_offer":
-            payload = message.get("payload", {})
-            username = payload.get("username")
-            key_pem = payload.get("public_key")
-            if username and key_pem:
-                try:
-                    public_key = load_pem_public_key(key_pem.encode('utf-8'))
-                    self.public_keys_cache[username] = public_key
-                except: pass
-            return
+            pass
+
+        elif msg_type == "p2p_ready":
+            sender = message.get("sender")
+            self.network_client.send_p2p_auth_challenge(sender)
+
+        elif msg_type == "p2p_auth_challenge":
+            sender = message.get("sender")
+            if self.private_key:
+                self.network_client.reply_to_p2p_auth_challenge(sender, message, self.private_key)
+
+        elif msg_type == "p2p_auth_response":
+            sender = message.get("sender")
+            if sender in self.public_keys_cache:
+                sender_pub_key = self.public_keys_cache[sender]
+                self.network_client.verify_p2p_auth_response(sender, message, sender_pub_key)
+
+        elif msg_type == "p2p_verified":
+            sender = message.get("username")
+            self.chat_display.append(f"<b style='color: green'>🔒 Conexão com {sender} verificada e segura!</b>")
         
-        if msg_type == "contact_list":
+        elif msg_type == "contact_list":
             self.all_users = message.get("all_users", [])
             self.online_users = set(message.get("online_users", []))
             self.populate_contacts()
@@ -153,6 +162,7 @@ class ChatWindow(QMainWindow):
             if target_user:
                 if target_user in self.public_keys_cache:
                     del self.public_keys_cache[target_user]
+                self.chat_display.append(f"<i style='color:orange'>As chaves de {target_user} mudaram. Renegociando segurança...</i>")
             
         elif msg_type == "typing_indicator": 
             sender = message.get("sender")
@@ -262,30 +272,28 @@ class ChatWindow(QMainWindow):
         text = self.message_entry.text()
         if not text: return
         
-        request = { "action": "send_message", "payload": { "recipient": recipient, "text": text } }
-        self.network_client.send_request(request)
+        sent_successfully = self.network_client.send_p2p_message(recipient, text)
         
-        timestamp = datetime.now().strftime("%H:%M")
-        
-        self.db.save_message(
-            user_id=self.current_user,
-            sender=self.current_user,
-            recipient=recipient,
-            text=text,
-            timestamp=timestamp,
-            is_sent_by_me=True
-        )
-        
-        self.display_message(self.current_user, recipient, text, timestamp) 
-        
-        self.message_entry.clear()
-        self.stop_typing_event() 
+        if sent_successfully:
+            timestamp = datetime.now().strftime("%H:%M")
+            self.db.save_message(
+                user_id=self.current_user,
+                sender=self.current_user,
+                recipient=recipient,
+                text=text,
+                timestamp=timestamp,
+                is_sent_by_me=True
+            )
+            self.display_message(self.current_user, recipient, text, timestamp) 
+            self.message_entry.clear()
+            self.stop_typing_event()
+        else:
+            self.chat_display.append(f"<b style='color: red'>Erro: A mensagem não pode ser entregue a {recipient} por questão de segurança.</b><br><i style='color: gray'>Motivo: Nenhuma chave de sessão negociada (o usuário provavelmente está offline).</i>")
 
     def on_contact_selected(self, current_item, previous_item):
         if not current_item or not current_item.flags() & QtCore.Qt.ItemFlag.ItemIsSelectable:
             self.chat_display.clear()
             self.setWindowTitle(f"KeiChat - Conectado como {self.current_user}")
-            
             self.typing_status_label.setText("") 
             return
         
@@ -295,7 +303,7 @@ class ChatWindow(QMainWindow):
             self.unread_senders.discard(contact_name)
             self.populate_contacts()
         
-        if contact_name not in self.public_keys_cache:            
+        if contact_name not in self.public_keys_cache:
             request = {"action": "get_public_key", "payload": {"username": contact_name}}
             self.network_client.send_request(request)
         
@@ -312,9 +320,7 @@ class ChatWindow(QMainWindow):
             )
         
         self.setWindowTitle(f"KeiChat - {self.current_user} - Conversando com {contact_name}")
-        
         self.typing_status_label.setText("")
-        
         self.chat_display.ensureCursorVisible()
         
     def display_message(self, sender, recipient, text, timestamp=""):
