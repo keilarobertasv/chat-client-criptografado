@@ -25,7 +25,7 @@ if __name__ == "__main__":
 	try:
 		local_db = ChatDatabase()
 		
-		network_client = NetworkClient(HOST, PORT)
+		network_client = NetworkClient(HOST, PORT, db_instance=local_db)
 		
 		if network_client.connect():
 			
