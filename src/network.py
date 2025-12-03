@@ -29,10 +29,11 @@ class NetworkClient(QtCore.QObject):
     connection_error = QtCore.pyqtSignal(str)
     p2p_handshake_needed = QtCore.pyqtSignal(str)
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, db_instance=None):
         super().__init__()
         self.host = host
         self.port = port
+        self.db = db_instance
         self.socket = None
         self.listening = False
         self.listener_thread = None
@@ -47,14 +48,22 @@ class NetworkClient(QtCore.QObject):
         self.pending_rekey_salt = None
 
         self.p2p_sessions = {} 
-        self.pending_p2p_handshakes = {} 
+        self.pending_p2p_handshakes = {}
+        
+        if self.db:
+            try:
+                self.p2p_sessions = self.db.load_sessions()
+                print(f"Sessões carregadas: {list(self.p2p_sessions.keys())}")
+            except Exception as e:
+                print(f"Erro ao carregar sessões: {e}")
+                self.p2p_sessions = {}
 
     def connect(self):
         try:
             with open(PARAMS_PATH, "rb") as f:
                 self.dh_parameters = load_pem_parameters(f.read())
         except Exception as e:
-            print(f"Erro fatal: {e}")
+            print(f"Erro fatal - Parâmetros DH não encontrados: {e}")
             return False
             
         try:
@@ -91,7 +100,7 @@ class NetworkClient(QtCore.QObject):
 
     def _decrypt_payload(self, encrypted_payload_bytes, aes_key, hmac_key):
         if not aes_key or not hmac_key:
-            raise Exception("Chaves de criptografia ausentes.")
+            return None
         
         try:
             wrapper = json.loads(encrypted_payload_bytes.decode('utf-8'))
@@ -111,7 +120,7 @@ class NetworkClient(QtCore.QObject):
             plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
             
             return plaintext.decode('utf-8')
-        except (InvalidSignature, KeyError, json.JSONDecodeError, Exception):
+        except (InvalidSignature, KeyError, json.JSONDecodeError, ValueError, Exception):
             return None
 
     def perform_handshake(self):
@@ -135,7 +144,7 @@ class NetworkClient(QtCore.QObject):
             
             self.socket.sendall(json.dumps(request).encode("utf-8") + b'\n')
             
-            response_data = self.socket.recv(2048)
+            response_data = self.socket.recv(4096)
             if not response_data:
                 return False, "Servidor não respondeu."
                 
@@ -161,6 +170,10 @@ class NetworkClient(QtCore.QObject):
             return False, f"Erro handshake: {e}"
 
     def start_p2p_handshake(self, target_username):
+
+        if target_username in self.pending_p2p_handshakes:
+            return
+
         try:
             print(f"[P2P] Iniciando negociação segura com {target_username}...")
             p2p_private_key = self.dh_parameters.generate_private_key()
@@ -214,6 +227,15 @@ class NetworkClient(QtCore.QObject):
                 'msg_count': 0, 
                 'start_time': datetime.now()
             }
+            
+            if self.db:
+                self.db.save_session(
+                    sender, 
+                    derived_keys[:32], 
+                    derived_keys[32:], 
+                    self.p2p_sessions[sender]['start_time'],
+                    0
+                )
 
             my_pub_pem = my_public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
             
@@ -261,12 +283,22 @@ class NetworkClient(QtCore.QObject):
                 'start_time': datetime.now()
             }
             
+            if self.db:
+                self.db.save_session(
+                    sender, 
+                    derived_keys[:32], 
+                    derived_keys[32:], 
+                    self.p2p_sessions[sender]['start_time'],
+                    0
+                )
+            
             self.message_received.emit({"type": "p2p_ready", "sender": sender})
             
         except Exception as e:
             print(f"Erro finalizando P2P: {e}")
 
     def send_p2p_message(self, recipient, plaintext_text, is_internal=False):
+
         if recipient not in self.p2p_sessions:
             if not is_internal:
                 self.start_p2p_handshake(recipient)
@@ -276,7 +308,9 @@ class NetworkClient(QtCore.QObject):
         elapsed_seconds = (datetime.now() - session['start_time']).total_seconds()
         
         if (session['msg_count'] >= 100 or elapsed_seconds > 3600) and not is_internal:
-            print(f"[P2P] Sessão com {recipient} expirou (Count: {session['msg_count']}). Renovando chaves...")
+            print(f"[P2P] Sessão com {recipient} expirou. Renovando chaves...")
+            if self.db:
+                self.db.delete_session(recipient)
             self.start_p2p_handshake(recipient)
             return False 
 
@@ -285,6 +319,14 @@ class NetworkClient(QtCore.QObject):
         
         if not is_internal:
             session['msg_count'] += 1
+            if self.db:
+                self.db.save_session(
+                    recipient, 
+                    keys['aes'], 
+                    keys['hmac'], 
+                    session['start_time'], 
+                    session['msg_count']
+                )
         
         request = {
             "action": "send_message",
@@ -299,18 +341,14 @@ class NetworkClient(QtCore.QObject):
 
     def send_p2p_auth_challenge(self, target_username):
         if target_username not in self.p2p_sessions: return
-        
         try:
-            print(f"[Auth] Enviando desafio de autenticação para {target_username}...")
             nonce = os.urandom(32)
             self.p2p_sessions[target_username]['pending_nonce'] = nonce
-            
             payload_dict = {
                 "type": "p2p_auth_challenge",
                 "nonce": base64.b64encode(nonce).decode('utf-8')
             }
             self.send_p2p_message(target_username, json.dumps(payload_dict), is_internal=True)
-            
         except Exception as e:
             print(f"Erro ao enviar desafio P2P: {e}")
 
@@ -318,22 +356,17 @@ class NetworkClient(QtCore.QObject):
         try:
             nonce_b64 = payload.get("nonce")
             if not nonce_b64: return
-            
             nonce = base64.b64decode(nonce_b64)
-            
             signature = my_private_key.sign(
                 nonce,
                 padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
                 hashes.SHA256()
             )
-            
             response_dict = {
                 "type": "p2p_auth_response",
                 "signature": base64.b64encode(signature).decode('utf-8')
             }
             self.send_p2p_message(sender, json.dumps(response_dict), is_internal=True)
-            print(f"[Auth] Desafio de {sender} assinado e devolvido.")
-            
         except Exception as e:
             print(f"Erro ao tratar desafio P2P: {e}")
 
@@ -341,9 +374,7 @@ class NetworkClient(QtCore.QObject):
         try:
             signature_b64 = payload.get("signature")
             if not signature_b64: return
-            
-            if sender not in self.p2p_sessions or 'pending_nonce' not in self.p2p_sessions[sender]:
-                return
+            if sender not in self.p2p_sessions or 'pending_nonce' not in self.p2p_sessions[sender]: return
 
             nonce = self.p2p_sessions[sender].pop('pending_nonce')
             signature = base64.b64decode(signature_b64)
@@ -356,14 +387,13 @@ class NetworkClient(QtCore.QObject):
             )
             
             self.p2p_sessions[sender]['verified'] = True
-            print(f"[Auth] Identidade de {sender} confirmada!")
-            
             self.message_received.emit({"type": "p2p_verified", "username": sender})
             
         except InvalidSignature:
             print(f"[Auth] FALHA: Assinatura de {sender} inválida!")
             if sender in self.p2p_sessions:
                 del self.p2p_sessions[sender]
+                if self.db: self.db.delete_session(sender)
         except Exception as e:
             print(f"Erro na verificação P2P: {e}")
 
@@ -385,11 +415,9 @@ class NetworkClient(QtCore.QObject):
 
     def _initiate_rekey(self):
         try:
-            print("INFO: O servidor solicitou renovação de chaves (Rekey).")
             self.pending_rekey_salt = os.urandom(16)
             self.pending_rekey_private_key = self.dh_parameters.generate_private_key()
             client_pub = self.pending_rekey_private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-            
             req = {
                 "action": "rekey_start",
                 "payload": {"dhe_public_key": client_pub.decode('utf-8'), "salt": base64.b64encode(self.pending_rekey_salt).decode('utf-8')}
@@ -443,8 +471,7 @@ class NetworkClient(QtCore.QObject):
                                         elif inner_json["type"] == "p2p_handshake_finish":
                                             self.finalize_p2p_handshake(sender, inner_json)
                                             continue
-                                except:
-                                    pass
+                                except: pass
                                 
                                 is_encrypted = False
                                 try:
@@ -456,8 +483,10 @@ class NetworkClient(QtCore.QObject):
                                 if sender in self.p2p_sessions and is_encrypted:
                                     keys = self.p2p_sessions[sender]
                                     decrypted_p2p = self._decrypt_payload(content.encode('utf-8'), keys['aes'], keys['hmac'])
+                                    
                                     if decrypted_p2p:
                                         msg["text"] = decrypted_p2p
+                                    
                                         try:
                                             p2p_content = json.loads(decrypted_p2p)
                                             if isinstance(p2p_content, dict) and "type" in p2p_content:
@@ -468,10 +497,18 @@ class NetworkClient(QtCore.QObject):
                                                     continue
                                         except: pass
                                     else:
-                                        msg["text"] = "[Erro na descriptografia P2P]"
+                                      
+                                        print(f"ERRO: Chave P2P inválida para {sender}. Apagando e renegociando.")
+                                        del self.p2p_sessions[sender]
+                                        if self.db: self.db.delete_session(sender)
+                                        
+                                        msg["text"] = "[Sincronizando chaves de segurança... Tente novamente em breve]"
+                                        self.start_p2p_handshake(sender)
                                 
                                 elif is_encrypted:
-                                    msg["text"] = "[Mensagem ilegível: Sessão anterior expirada ou chaves perdidas]"
+                                    print(f"ERRO: Mensagem criptografada sem sessão para {sender}. Renegociando.")
+                                    msg["text"] = "[Nova sessão de segurança solicitada...]"
+                                    self.start_p2p_handshake(sender) 
 
                                 self.message_received.emit(msg)
                             
@@ -479,7 +516,8 @@ class NetworkClient(QtCore.QObject):
                                 self.message_received.emit(msg)
                                 
                         except json.JSONDecodeError: pass
-        except: pass
+        except Exception as e:
+            print(f"Erro listener: {e}")
         finally:
             self.listening = False
             self.close()

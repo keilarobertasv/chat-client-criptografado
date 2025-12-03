@@ -13,7 +13,7 @@ KEY_FILE_PATH = os.path.join(PROJECT_ROOT, "local_storage.key")
 
 class ChatDatabase:
     def __init__(self, db_name=DEFAULT_DB_PATH):
-        self.conn = sqlite3.connect(db_name)
+        self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self._create_tables()
         self._load_or_generate_key()
@@ -28,6 +28,16 @@ class ChatDatabase:
                 text TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 is_sent_by_me INTEGER NOT NULL
+            )
+        """)
+        
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS p2p_sessions (
+                partner_username TEXT PRIMARY KEY,
+                aes_key TEXT NOT NULL,
+                hmac_key TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                msg_count INTEGER NOT NULL
             )
         """)
         self.conn.commit()
@@ -82,6 +92,53 @@ class ChatDatabase:
             "INSERT INTO messages (user_id, sender, recipient, text, timestamp, is_sent_by_me) VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, sender, recipient, encrypted_text, timestamp, 1 if is_sent_by_me else 0)
         )
+        self.conn.commit()
+
+    def save_session(self, partner_username, aes_key_bytes, hmac_key_bytes, start_time_dt, msg_count):
+        aes_b64 = base64.b64encode(aes_key_bytes).decode('utf-8')
+        hmac_b64 = base64.b64encode(hmac_key_bytes).decode('utf-8')
+        
+        enc_aes = self._encrypt_text(aes_b64)
+        enc_hmac = self._encrypt_text(hmac_b64)
+        
+        start_str = start_time_dt.isoformat()
+
+        self.cursor.execute("""
+            INSERT OR REPLACE INTO p2p_sessions 
+            (partner_username, aes_key, hmac_key, start_time, msg_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (partner_username, enc_aes, enc_hmac, start_str, msg_count))
+        self.conn.commit()
+
+    def load_sessions(self):
+        self.cursor.execute("SELECT partner_username, aes_key, hmac_key, start_time, msg_count FROM p2p_sessions")
+        sessions = {}
+        rows = self.cursor.fetchall()
+        
+        for row in rows:
+            partner, enc_aes, enc_hmac, start_str, count = row
+            try:
+                aes_b64 = self._decrypt_text(enc_aes)
+                hmac_b64 = self._decrypt_text(enc_hmac)
+                
+                aes_bytes = base64.b64decode(aes_b64)
+                hmac_bytes = base64.b64decode(hmac_b64)
+                start_dt = datetime.fromisoformat(start_str)
+                
+                sessions[partner] = {
+                    'aes': aes_bytes,
+                    'hmac': hmac_bytes,
+                    'verified': True,
+                    'msg_count': count,
+                    'start_time': start_dt
+                }
+            except Exception as e:
+                print(f"Erro ao carregar sessão de {partner}: {e}")
+        
+        return sessions
+    
+    def delete_session(self, partner_username):
+        self.cursor.execute("DELETE FROM p2p_sessions WHERE partner_username = ?", (partner_username,))
         self.conn.commit()
 
     def get_conversation_history(self, user_id, partner_name):
